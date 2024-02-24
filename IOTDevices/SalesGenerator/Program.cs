@@ -1,31 +1,155 @@
 ﻿using CsvHelper;
+using Microsoft.Azure.Cosmos;
+using Microsoft.EntityFrameworkCore;
 using Newtonsoft.Json;
 using Parquet.Serialization;
+using SalesGenerator.Cosmos;
+using SalesGenerator.EF;
+using System.ComponentModel;
 using System.Globalization;
 
 namespace SalesGenerator;
 
 internal class Program
 {
+    static int datasetSize = 100;
     static int pageNr = 1;
     static string mainFolder = "sales_small";
     static int orderId = 1;
     static int customerId = 1;
     static int productId = 1;
+    static string sqlConnString = @"Server=.\SQLEXPRESS;Database=SalesDatabase;Trusted_Connection=True;MultipleActiveResultSets=true;TrustServerCertificate=True;";
+    static string cosmoConnString = @"AccountEndpoint=https://4dn-cosmos-sales.documents.azure.com:443/;AccountKey=Lt0uq8Db4AHLSwxzRURygeDglXAyd75H2R05JMLdiTfCrb0NxE407MK27KbKFoV03nIY3xhcoO3CACDbUREiQg==;";
 
     static void Main(string[] args)
+    {
+        CreateFiles(mainFolder);        
+        //CreateSqlData(sqlConnString);
+        //CreateCosmosData(cosmoConnString);
+    }
+
+    private static void CreateFiles(string mainFolder)
     {
         if (Directory.Exists(mainFolder)) Directory.Delete(mainFolder, true);
         Directory.CreateDirectory(mainFolder);
 
-        var nrOfSales = 100;
         for (pageNr = 1; pageNr < 10; pageNr++)
         {
-            var dataset = GenerateDataset(nrOfSales);
+            var dataset = GenerateDataset(datasetSize);
             CreateCSV(dataset);
             CreateJson(dataset);
             CreateParquet(dataset);
         }
+    }
+
+    private static void CreateCosmosData(string cosmoConnString)
+    {
+        var context = new CosmosContext(cosmoConnString);
+        if (!context.CreateDatabase())
+        {
+            return;
+        }
+        var dataset = GenerateDataset(datasetSize);
+
+        var dsproduct = dataset.products.Select(p => new Cosmos.Product
+        {
+            Id = p.Id,
+            BrandName = p.BrandName,
+            Name = p.Name,
+            Price = p.Price,
+            PartitionKey = "product"
+        }).ToList(); 
+        context.AddProducts(dsproduct);
+
+        var dscust = dataset.customers.Select(c =>
+        {
+            var doc = new Cosmos.Customer
+            {
+                Id = c.Id,
+                CompanyName = c.CompanyName,
+                LastName = c.LastName,
+                FirstName = c.FirstName,
+                Address = c.Address
+            };
+            doc.PartitionKey = doc.InternalId;
+            return doc;
+        }).ToList();
+        context.AddCustomers(dscust);
+
+        var dsorders = dataset.orders.Select(o => {
+            var doc = new Cosmos.SalesOrder
+            {
+                Id = o.Id,
+                CustomerId = o.CustomerId,
+                OrderDate = o.OrderDate,
+                ProductId = o.ProductId,
+                Quantity = o.Quantity,
+                TotalPrice = o.TotalPrice
+            };
+            doc.PartitionKey = doc.CustomerId.ToDocumentId(nameof(Cosmos.Customer));
+            return doc;
+        }).ToList();
+        context.AddOrders(dsorders);
+    }
+
+    private static void CreateSqlData(string sqlConnString)
+    {
+        var bld = new DbContextOptionsBuilder();
+        bld.UseSqlServer(sqlConnString);      
+        var context = new EF.SqlDbContext(bld.Options);
+        context.Database.EnsureCreated();
+
+        var dataset = GenerateDataset(datasetSize);
+        
+        foreach(var product in dataset.products)
+        {
+            var prod = new EF.Product
+            {
+                Name = product.Name,
+                Price = product.Price
+            };
+            var dbBrand = context.Brands.FirstOrDefault(b=>b.Name == product.BrandName);
+            if (dbBrand == null)
+                prod.Brand = new EF.Brand { Name = product.BrandName };
+            else
+                prod.Brand = dbBrand;
+
+            context.Products.Add(prod);
+            context.SaveChanges();
+        }
+        
+        foreach(var customer in dataset.customers)
+        {
+            var address = new EF.Address
+            {
+                City = customer.Address?.City,
+                Country = customer.Address?.Country,
+                StreetName = customer.Address?.StreetName,
+                Number = customer.Address!.Number,
+                Region = customer.Address?.Region
+            };
+            context.Customers.Add(
+                new EF.Customer { 
+                    Address = address,
+                    CompanyName = customer.CompanyName,
+                    FirstName = customer.FirstName,
+                    LastName = customer.LastName
+                });    
+        }
+        context.SaveChanges();
+        foreach (var item in dataset.orders)
+        {
+            var order = new EF.SalesOrder
+            {
+                OrderDate = item.OrderDate,
+                Quantity = item.Quantity,
+                TotalPrice = item.TotalPrice
+            };
+            order.Customer = context.Customers.FirstOrDefault(c => c.Id == item.CustomerId);
+            order.Product = context.Products.FirstOrDefault(p=>p.Id == item.ProductId);
+            context.Orders.Add(order);
+        }
+        context.SaveChanges();
     }
 
     private static void CreateParquet((List<Customer> customers, List<Product> products, List<SalesOrder> orders) dataset)
